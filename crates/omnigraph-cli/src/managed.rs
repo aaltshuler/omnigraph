@@ -98,6 +98,7 @@ struct Context {
     version: u8,
     cluster: String,
     api: String,
+    organization_id: String,
 }
 
 /// Only exact loopback hosts may use HTTP. Url parsing canonicalizes DNS
@@ -141,7 +142,56 @@ fn identifier(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn read_context(config: &Path) -> Result<Option<Context>> {
+fn organization_id(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(Failure::refused(
+            "organization_invalid",
+            "organization IDs contain 1–128 ASCII letters, digits, underscores, or hyphens",
+        ));
+    }
+    Ok(())
+}
+
+fn selected_organization<'a>(
+    context: Option<&'a Context>,
+    origin: &str,
+    explicit: Option<&'a str>,
+) -> Result<Option<&'a str>> {
+    if let Some(org) = explicit {
+        organization_id(org)?;
+    }
+    if let Some(context) = context {
+        if context.api != origin || explicit.is_some_and(|org| org != context.organization_id) {
+            return Err(Failure::refused(
+                "context_mismatch",
+                "the explicit API or organization differs from the selected folder context",
+            ));
+        }
+        return Ok(Some(&context.organization_id));
+    }
+    Ok(explicit)
+}
+
+fn session_organization(
+    config: &Path,
+    origin: &str,
+    explicit: Option<&str>,
+) -> Result<Option<String>> {
+    // Explicit session management is independent of any folder binding.
+    let context = if explicit.is_some() {
+        None
+    } else {
+        read_context(config)?
+    };
+    selected_organization(context.as_ref(), origin, explicit).map(|org| org.map(str::to_owned))
+}
+
+fn read_context_bytes(config: &Path) -> Result<Option<Vec<u8>>> {
     let dir = config.join(".omnigraph");
     let invalid_file = || {
         Failure::refused(
@@ -190,14 +240,28 @@ fn read_context(config: &Path) -> Result<Option<Context>> {
     let invalid = || {
         Failure::refused(
             "context_invalid",
-            ".omnigraph/context must be valid version 1 YAML, at most 16 KiB, with only version, cluster, and api fields",
+            ".omnigraph/context must be valid version 2 YAML, at most 16 KiB, with only version, cluster, api, and organization_id fields; bind again with use after a fresh managed login",
         )
     };
     if bytes.len() as u64 > MAX_CONTEXT {
         return Err(invalid());
     }
+    Ok(Some(bytes))
+}
+
+fn read_context(config: &Path) -> Result<Option<Context>> {
+    let Some(bytes) = read_context_bytes(config)? else {
+        return Ok(None);
+    };
+    let invalid = || {
+        Failure::refused(
+            "context_invalid",
+            "use a version 2 managed context; sign in with explicit --api and --organization, then bind again with use --api and --organization",
+        )
+    };
     let context: Context = yaml_serde::from_slice(&bytes).map_err(|_| invalid())?;
-    if context.version != 1
+    if context.version != 2
+        || organization_id(&context.organization_id).is_err()
         || identifier(&context.cluster).is_err()
         || !canonical_origin(&context.api).is_ok_and(|origin| origin == context.api)
     {
@@ -214,6 +278,7 @@ fn save_context(config: &Path, context: &Context) -> Result<()> {
             1,
         )
     };
+    read_context_bytes(config)?;
     let dir = config.join(".omnigraph");
     std::fs::create_dir_all(&dir).map_err(|_| fail())?;
     let mut file = tempfile::NamedTempFile::new_in(&dir).map_err(|_| fail())?;
@@ -228,7 +293,7 @@ struct Api {
     client: Client,
     origin: String,
     token: Option<String>,
-    cached_session: bool,
+    selection: Option<auth::Selection>,
 }
 
 struct Response {
@@ -254,14 +319,36 @@ impl Api {
             client,
             origin,
             token,
-            cached_session: false,
+            selection: None,
         })
     }
 
-    fn authenticated(origin: String) -> Result<Self> {
+    async fn authenticated(origin: String, organization: Option<&str>) -> Result<Self> {
+        let selection = auth::select(&origin, organization).await?;
         let mut api = Self::new(origin, None)?;
-        api.cached_session = true;
+        api.selection = Some(selection);
         Ok(api)
+    }
+
+    fn account_id(&self) -> Result<&str> {
+        self.selection
+            .as_ref()
+            .map(|s| s.account_id.as_str())
+            .ok_or_else(Failure::protocol)
+    }
+
+    fn matches_principal(&self, principal: &str, account: &str) -> Result<()> {
+        if self
+            .selection
+            .as_ref()
+            .is_none_or(|s| s.account_id != account || s.principal_id != principal)
+        {
+            return Err(Failure::refused(
+                "session_identity_mismatch",
+                "the API identity changed during this invocation",
+            ));
+        }
+        Ok(())
     }
 
     async fn raw(
@@ -283,8 +370,8 @@ impl Api {
         key: Option<&str>,
         timeout: Duration,
     ) -> Result<Response> {
-        let token = if self.cached_session {
-            Some(Box::pin(auth::credential(&self.origin)).await?)
+        let token = if let Some(selection) = &self.selection {
+            Some(Box::pin(selection.credential(&self.origin)).await?)
         } else {
             self.token.clone()
         };
@@ -344,7 +431,7 @@ impl Api {
             bytes.extend_from_slice(&chunk);
         }
         let mut body: Value = serde_json::from_slice(&bytes).map_err(|_| Failure::protocol())?;
-        if self.cached_session
+        if self.selection.is_some()
             && let Some(token) = &token
         {
             auth::scrub_value(&mut body, token);
@@ -537,7 +624,6 @@ async fn cluster_command(
             .await
             .map(|body| (body, 0));
     }
-    let api = Api::authenticated(context.api.clone())?;
     let base = format!("/v1/clusters/{}", context.cluster);
     match command {
         ClusterCommand::Plan { run, .. } | ClusterCommand::Apply { run, .. } => {
@@ -567,6 +653,8 @@ async fn cluster_command(
                 _ => unreachable!(),
             };
             let key = idempotency_key(run.idempotency_key.as_deref())?;
+            let api =
+                Api::authenticated(context.api.clone(), Some(&context.organization_id)).await?;
             let path = format!("{base}/runs");
             let submission = api.request(Method::POST, &path, Some(&body), Some(&key));
             let response = if run.no_wait {
@@ -579,8 +667,12 @@ async fn cluster_command(
             wait_run(&api, context, response, run, deadline).await
         }
         ClusterCommand::Status { run_id, .. } => {
-            let body = if let Some(id) = run_id {
+            if let Some(id) = run_id {
                 identifier(id)?;
+            }
+            let api =
+                Api::authenticated(context.api.clone(), Some(&context.organization_id)).await?;
+            let body = if let Some(id) = run_id {
                 let body = api
                     .request(Method::GET, &format!("/v1/runs/{id}"), None, None)
                     .await?;
@@ -607,6 +699,8 @@ async fn cluster_command(
                     })?;
                 url.query_pairs_mut().append_pair("since", since);
             }
+            let api =
+                Api::authenticated(context.api.clone(), Some(&context.organization_id)).await?;
             let body = api
                 .request(Method::GET, &url[url::Position::BeforePath..], None, None)
                 .await?;
@@ -615,6 +709,8 @@ async fn cluster_command(
         }
         ClusterCommand::Cancel { run_id, .. } => {
             identifier(run_id)?;
+            let api =
+                Api::authenticated(context.api.clone(), Some(&context.organization_id)).await?;
             let before = api
                 .request(Method::GET, &format!("/v1/runs/{run_id}"), None, None)
                 .await?;
@@ -646,38 +742,56 @@ pub(crate) async fn dispatch(cli: &Cli) -> Option<Output> {
     match &cli.command {
         Command::Login {
             api: Some(api),
+            organization,
             json,
             ..
         } => {
-            let result = match reject_scope(cli).and_then(|()| canonical_origin(api)) {
-                Ok(origin) => auth::login(origin).await,
-                Err(err) => Err(err),
-            };
+            let result = async {
+                reject_scope(cli)?;
+                let origin = canonical_origin(api)?;
+                let selected =
+                    session_organization(Path::new("."), &origin, organization.as_deref())?;
+                auth::login(origin, selected.as_deref()).await
+            }
+            .await;
             Some(Output::from_result(result, *json, 0))
         }
         Command::Logout {
             api: Some(api),
+            organization,
             json,
             ..
         } => {
-            let result = match reject_scope(cli).and_then(|()| canonical_origin(api)) {
-                Ok(origin) => auth::logout(origin).await,
-                Err(err) => Err(err),
-            };
+            let result = async {
+                reject_scope(cli)?;
+                let origin = canonical_origin(api)?;
+                let selected =
+                    session_organization(Path::new("."), &origin, organization.as_deref())?;
+                auth::logout(origin, selected.as_deref()).await
+            }
+            .await;
             Some(Output::from_result(result, *json, 0))
         }
         Command::Use {
             cluster_id,
             api,
+            organization,
             config,
             json,
         } => {
             let result = async {
                 reject_scope(cli)?;
                 identifier(cluster_id)?;
-                read_context(config)?;
+                let context = if organization.is_some() {
+                    read_context_bytes(config)?;
+                    None
+                } else {
+                    read_context(config)?
+                };
                 let origin = canonical_origin(api)?;
-                let client = Api::authenticated(origin.clone())?;
+                let selected =
+                    selected_organization(context.as_ref(), &origin, organization.as_deref())?;
+                let client = Api::authenticated(origin.clone(), selected).await?;
                 let body = client
                     .request(
                         Method::GET,
@@ -693,7 +807,8 @@ pub(crate) async fn dispatch(cli: &Cli) -> Option<Output> {
                 save_context(
                     config,
                     &Context {
-                        version: 1,
+                        version: 2,
+                        organization_id: client.account_id()?.into(),
                         cluster: cluster_id.clone(),
                         api: origin,
                     },
