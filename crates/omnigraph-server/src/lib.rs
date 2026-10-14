@@ -2154,6 +2154,7 @@ mod external_blob_startup_tests {
         );
         let key = GraphKey::cluster(GraphId::try_from("blocked").unwrap());
         let prepared = PreparedGraphOpen {
+            io_scope: None,
             cfg: GraphStartupConfig {
                 startup_failure: None,
                 graph_id: "blocked".to_string(),
