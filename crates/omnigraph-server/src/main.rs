@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use color_eyre::eyre::Result;
 use omnigraph_server::{
-    init_tracing, load_server_settings, load_server_settings_with_bootstrap_handoff,
+    load_server_settings, load_server_settings_with_bootstrap_handoff,
     load_server_settings_with_identity_trust, resolve_shutdown_grace, serve,
     serve_with_data_token_trust,
 };
@@ -61,9 +61,14 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
-    init_tracing();
-
     let cli = Cli::parse();
+    let telemetry = tokio::task::spawn_blocking(omnigraph_server::telemetry::init).await??;
+    let result = run(cli).await;
+    telemetry.shutdown_in_background();
+    result
+}
+
+async fn run(cli: Cli) -> Result<()> {
     if let Some(receipt_path) = cli.bootstrap_handoff.as_deref() {
         let shutdown_grace = resolve_shutdown_grace(cli.shutdown_grace_seconds)?;
         let settings = load_server_settings_with_bootstrap_handoff(
