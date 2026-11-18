@@ -13,6 +13,8 @@ supersedes: []
 superseded_by: []
 blocked_on:
   - "The lexical oracle fixtures and the four Lance guards hold on Lance 13.0.0 (spike `spike/gq3-lexical`, 2026-11-08); the certified-margin fetch of this RFC prototyped against the inversion guard before stage L ships it"
+  - "The exact scan's cost and stage L's saving measured by a checked-in instrument (invariant 13); the only figures are the implementation guide's, about 9.7 s against about 113 ms over 171,000 documents"
+  - "Unresolved question 3 settled before stage L: where the derived token column lives and how its coverage is tracked across updates, compaction and merges"
 ---
 
 # RFC: Schema-owned search contracts
@@ -39,7 +41,7 @@ schema and the plan, never from index presence, coverage or segment layout
 state; a native index accelerates only where it proves the same answer.
 
 - **Text.** `@index(fulltext, analyzer = …, scorer = …)` on a String
-  property, with three immutable analyzer profiles and the `bm25_v1` scorer
+  property, with four immutable analyzer profiles and the `bm25_v1` scorer
   over the field corpus.
 - **Lexical matching.** One matching rule at every edit budget, applied with
   the field's analyzer to document and query text, and answered by an exact
@@ -97,19 +99,19 @@ node Doc {
 }
 ```
 
-`analyzer` names one of three immutable profiles; `scorer` is `bm25_v1`
+`analyzer` names one of four immutable profiles; `scorer` is `bm25_v1`
 (the default) or `none`, which allows matching and makes a ranking call on
 the field a type error. Every setting of a profile is explicit; unspecified
 Lance defaults are never part of the contract.
 
-| Setting | `standard_v1` | `standard_folded_v1` | `english_v1` |
-|---|---|---|---|
-| Tokenizer | `simple` | `simple` | `simple` |
-| Lowercase | yes | yes | yes |
-| Stemming and stop words | neither | neither | English stemmer, then the English stop list: each word and its stem |
-| ASCII folding | no | yes | yes, after stemming |
-| Token-length filter | disabled | disabled | disabled |
-| Unicode normalization | NFC before tokenization | same | same |
+| Setting | `standard_v1` | `standard_folded_v1` | `english_v1` | `english_legacy_v1` |
+|---|---|---|---|---|
+| Tokenizer | `simple` | `simple` | `simple` | `simple` |
+| Lowercase | yes | yes | yes | yes |
+| Stemming and stop words | neither | neither | English stemmer, then the English stop list: each word and its stem | English stemmer, then the plain English stop list |
+| ASCII folding | no | yes | yes, after stemming | yes, after stemming |
+| Token-length filter | disabled | disabled | disabled | tokens of 40 bytes or more dropped |
+| Unicode normalization | NFC before tokenization | same | same | none |
 
 `english_v1` keeps Lance's filter order, the only order Lance's index builder
 produces, so a native index can implement it. Because stemming runs first, a
@@ -138,14 +140,19 @@ with no schema change and no new profile.
 
 A profile never changes once accepted; a different pipeline is a new
 profile, and a new profile or scorer version needs an RFC. There are no
-query-time analyzer overrides. An omitted `analyzer` is `english_v1`, as an
-omitted distance is `l2`, so every full-text field has exactly one profile
-and the contract below applies to every field *[choice]*. Today's index
-analysis, Lance's default (English stemming, the plain stop list, ASCII
-folding, and a filter that drops tokens of 40 bytes or more, with no NFC),
-is not a profile and does not survive stage D ([Rollout](#rollout)); it differs from
-`english_v1` in the token filter, the stop list's stems and NFC, so rows
-change where one of those applies (Compatibility). From stage D there is no
+query-time analyzer overrides. An omitted `analyzer` resolves once, when the
+field first gains its full-text index, as a default recipe does: to
+`english_v1` from stage D on ([Rollout](#rollout)), and to
+`english_legacy_v1` for a field whose index an accepted schema declared
+before stage D *[choice]*. So every full-text field has exactly one profile
+and the contract below applies to every field. `english_legacy_v1` is
+today's index analysis, Lance's default (English stemming, the plain stop
+list, ASCII folding, and a filter that drops tokens of 40 bytes or more,
+with no NFC), stated as a profile with its stop list checked in, so no
+accepted field changes its analysis at upgrade. It differs from
+`english_v1` in the token filter, the stop list's stems and NFC, and a
+field moves to another profile by declaring one. Canonical export spells
+out every field's resolved profile. From stage D there is no
 `FullTextIndexRequired`: a field with no index, a partial one or one built
 for another analysis is answered by the exact scan. A profile is applied in
 place: RFC 0043's certificate records the field's analyzer fingerprint, so a
@@ -188,9 +195,16 @@ acceleration
 (invariant 7): the planner uses one only where its answer equals the scan's,
 rechecks the candidates where Lance's index returns a superset (as NGRAM
 does), and falls back to the scan wherever coverage is missing or partial.
-Each kind has its fence row and guard in `lance.md`. No accepted schema
-changes meaning; an existing graph gains the new kinds through explicit
-index reconciliation.
+Each kind has its fence row and guard in `lance.md`. One accepted
+declaration would change meaning: today a plain `@index` on a String builds
+a full-text index and nothing else. The derivation is therefore a feature
+name under RFC 0040 *[choice]*: a contract accepted without it keeps
+reading a String's `@index` as its full-text index, so no built index goes
+unused at upgrade; the first `schema plan` under the feature shows each
+such property changing from a full-text index to BTREE and NGRAM, and
+prints `@index(fulltext)` as the spelling that keeps it. No other accepted
+declaration changes meaning; an existing graph gains the new kinds through
+explicit index reconciliation.
 
 **Vectors.** `Vector(n, distance = "l2" | "cosine" | "dot")`; an omitted
 distance is `l2`, today's meaning, so no accepted schema changes meaning.
@@ -336,7 +350,9 @@ native index with the experimental 256-document posting blocks quantizes
 document lengths, so the RFC 0043 certificate that qualifies one records the
 posting block size, the format version and whether positions are stored, and
 a 256-block index never qualifies. A native index also carries no NFC step,
-and Lance's tokenizer is not the profile's analyzer, so stage L shares one
+and Lance's tokenizer is not the profile's analyzer, except for
+`english_legacy_v1`, which is defined as that pipeline and whose index
+needs no token column. For the other profiles stage L shares one
 analyzer between index and scan *[choice]*. During explicit reconciliation
 the engine runs the field's profile analyzer over each row and writes the
 analyzed terms, in order and space-separated, to a derived token column;
@@ -361,7 +377,7 @@ rule addition with its own regression.
 
 A cut over an order over a zero-edit lexical ranking (GQ 3's `Cut` over
 `Order` over `bm25`) may use Lance's limited
-full-text path, block-max WAND, as a ***certified candidate generator***
+full-text path as a ***certified candidate generator***
 when nothing above the scan drops rows, every filter is a prefilter under
 full coverage, no fragment of the table carries a deletion file, no
 row-level read policy narrows the property's entities, and the property's
@@ -381,18 +397,26 @@ which is why bit-identity with Lance is not exactness and the margin is
 needed. The fetch prunes scoring work by an amount that depends on `k`
 against the matched set and is not reproducible run to run, so the plan
 states its cost as the unlimited scan's and the report keeps Lance's
-comparison counter out of anything replay compares.
+comparison counter out of anything replay compares. Lance 13 runs the
+limited path as its bulk MAXSCORE scorer by default and as the classic
+block-max WAND loop under `LANCE_FTS_MAXSCORE=0`, with `LANCE_FTS_BULK_AND`
+and `LANCE_FTS_SEARCH_CHUNK` selecting further variants. Lance documents
+their results as score-identical; they are process environment, so the
+engine pins them or the plan records them.
 
 ### Vector distances and indexes
 
 A returned distance is always the exact distance under the field's distance;
 approximation affects only which targets are found. Today's index family,
 IVF_FLAT, keeps raw vectors for `l2` and `dot` and meets this there. For
-`cosine`, Lance stores the vectors normalized and searches them under L2, so
-an index-served value is not the field's cosine distance and differs from
-the flat path's value on the uncovered tail; a `cosine` search therefore
-re-scores its candidates on the stored vectors (Lance's `refine`), as a
-quantized family must for every distance. Missing coverage never drops the
+`cosine`, Lance normalizes the vectors in its transform, uses L2 only to
+assign partitions, and scores the flat storage under the index's own
+distance, cosine with cached norms (`IvfTransformer::new_flat`, the flat
+storage's distance calculator). An index-served value is therefore a
+cosine distance, equal to the field's up to `f32` rounding, which need not
+be bit-equal to the flat path's value on the uncovered tail; a `cosine`
+search re-scores its candidates on the stored vectors (Lance's `refine`)
+for that reason, as a quantized family must for every distance. Missing coverage never drops the
 uncovered rows; it changes cost.
 
 ### Left out
@@ -432,18 +456,29 @@ precondition on index coverage.
 ## Compatibility and reversibility
 
 - **Schema.** Every declaration of this RFC is additive and applied in
-  place: an omitted distance is `l2`; an index without `analyzer` takes
-  `english_v1`, served by the exact scan until its index is rebuilt with
-  the profile; a field that declares an analyzer or changes a distance
+  place: an omitted distance is `l2`; an index declared before stage D
+  without `analyzer` resolves to `english_legacy_v1`, the analysis it was
+  built with, and one declared from stage D on to `english_v1`; a String's
+  plain `@index` keeps its full-text index until a `schema plan` under the
+  scalar-kinds feature shows the change; a field that declares an analyzer or changes a distance
   rebuilds its index once; one that changes a recipe regenerates its
   vectors. No export and reload.
 - **Results.** Rows change only where today's answer depended on index
-  state or letter case, and on every full-text field where today's
-  analysis differs from its profile (`english_v1` by default, differing by
-  the token filter, the stop list's stems and NFC); `bm25` scores are
+  state or letter case; a field's analysis changes only when its schema
+  declares another profile; `bm25` scores are
   `bm25_v1`'s `F64` on every field, where today's are Lance's `F32`. A
   read that is refused today with `FullTextIndexRequired` returns rows.
   Scores change on adopting fields.
+- **Cost.** Wherever stage L does not serve a query, a lexical predicate or
+  ranking reads and analyzes the field's whole text at the query's
+  snapshot, whatever filter or `limit` the query carries, and a `bm25`
+  needs the whole field corpus for its statistics whatever its population.
+  The implementation's guide (PR #1316 at `c2051634`) reports about 9.7 s
+  over a 171,000-document corpus on two CPUs, where the native index it
+  replaced answered in about 113 ms. With stage L a query still scans where
+  L does not qualify it: an edit-tolerant query until its expansion is
+  qualified, and a limited `bm25` on a table that carries a deletion file,
+  the usual state of a table that takes updates or deletes.
 - **Reverting.** Reverting a
   distance or recipe needs the rebuild or regeneration that adopting it
   needed. An older binary refuses a full-text index the new binary built or
@@ -458,6 +493,9 @@ precondition on index coverage.
 | An explicit distance required on every vector | Every accepted schema would break; an omitted distance is `l2`, what they mean today |
 | Native fuzzy defaults or truncated expansion as the contract; rescoping statistics by every graph filter; a warning on unindexed search | Results would change with analyzer, index and segment state; rescoping can reverse the order of the same entities; a warning does not repair a matched set |
 | Bit-identity with Lance's unlimited scan as the WAND qualification | Lance scores in `f32`; two documents whose `F64` scores differ by less than an ulp can tie or invert, and did on a real index, so a certified margin with an `F64` rescore is needed, not a tie check |
+| `english_v1` for every field without `analyzer`, accepted fields included (the GQ 3 RFC from 2026-11-15) | Every accepted full-text field would change its analysis at upgrade, so one query returns different rows over the same data; a default that resolves once, as a recipe's does, changes none |
+| The scalar kinds derived for every accepted `@index` when the binary changes | An accepted String `@index` would lose its full-text index with no schema change and the built index would go unread; as a feature name the change appears in `schema plan` and is chosen |
+| Stage D alone, the exact scan as the only path before any acceleration | Every full-text read becomes a whole-field scan (Compatibility, Cost) |
 | These contracts as section 4 of the GQ 3 RFC (that RFC from 2026-11-07 to 2026-11-18) | They are `.pg` declarations and call meanings that need no edition-3 form, and they have another way back: an index built under a profile is undone by a rebuild or a backup restore, the break by reverting a change. In one document, accepting, shipping or reverting either one waited on the other |
 
 ## Evidence and tests
@@ -514,8 +552,8 @@ is why the certified margin rescores outside Lance.
 
 | Stage | Contents | Ships after |
 |---|---|---|
-| **D** declarations and the exact scan | the schema declarations of this RFC (`analyzer` with `english_v1` as its default, `scorer`, `distance`, the default recipe, the scalar index kinds by type, the measured analyzer fingerprint in RFC 0043 certificates); the exact lexical scan on every full-text field | nothing |
-| **L** lexical acceleration | native full-text acceleration where an artifact proves parity: the certified-margin fetch for zero-edit `bm25` with its preconditions, complete fuzzy expansion through `with_max_expansions` within the automaton's limit, the shared analyzer (a derived token column indexed with Lance's `whitespace` tokenizer, which carries NFC into the index), the RFC 0043 certificate with posting block size, format version and positions, a query that repeats an analyzed term scoring as the same query without the repetition, the `lance.md` fence row | D |
+| **D** declarations and the exact scan | the schema declarations of this RFC (`analyzer` with its default resolved once, `scorer`, `distance`, the default recipe, the scalar index kinds by type, the measured analyzer fingerprint in RFC 0043 certificates); the exact lexical scan on every full-text field | nothing |
+| **L** lexical acceleration | native full-text acceleration where an artifact proves parity: the certified-margin fetch for zero-edit `bm25` with its preconditions, complete fuzzy expansion through `with_max_expansions` within the automaton's limit, the shared analyzer (a derived token column indexed with Lance's `whitespace` tokenizer, which carries NFC into the index), the RFC 0043 certificate with posting block size, format version and positions, a query that repeats an analyzed term scoring as the same query without the repetition, the `lance.md` fence row | D; its zero-edit paths in D's release |
 | recipe providers | recipe providers that prove an immutable revision | D |
 
 Stage D is what the GQ 3 RFC's stage B carried for these fields, under its
@@ -526,6 +564,12 @@ search calls read these contracts. Shipped before the break, edition 2's
 through the mapping in
 [What a query surface supplies](#what-a-query-surface-supplies), and the
 result changes of Compatibility arrive with D, not with the break.
+
+D and stage L's zero-edit paths ship in one release *[choice]*. Alone, D
+would turn every full-text read into a whole-field scan (Compatibility,
+Cost), so the release that makes the scan the reference also carries the
+index path for a qualified zero-edit query. L's edit-tolerant expansion may
+follow.
 
 ## Unresolved questions
 
@@ -545,6 +589,11 @@ result changes of Compatibility arrive with D, not with the break.
    Before it, edition 2's search calls change rows as Compatibility lists
    while edition 2 is still accepted; with it, one release carries both and
    they revert together.
+6. Whether an index built before stage D qualifies for `english_legacy_v1`
+   under its existing RFC 0043 certificate, which records no measured
+   fingerprint, or is served by the scan until it is rebuilt.
+7. The storage and build cost of an NGRAM index on every `@index` String,
+   not yet measured, and whether NGRAM is derived by default or asked for.
 
 ## Decision log
 
@@ -564,3 +613,19 @@ result changes of Compatibility arrive with D, not with the break.
   a change, "edition 2" became "today" and "the break" became "stage D".
   The decisions behind the moved text are in the GQ 3 RFC's decision log up
   to 2026-11-17.
+- 2026-11-18: fixes from the review of PR #1302. Three rules change, each so
+  that an accepted declaration keeps the meaning it was accepted with. An
+  omitted `analyzer` resolves once: `english_legacy_v1`, today's analysis
+  stated as a fourth profile, for a field indexed before stage D, and
+  `english_v1` after; before, every accepted field changed analysis at
+  upgrade. The scalar index kinds are a feature name, so an accepted
+  String `@index` keeps its full-text index until a `schema plan` shows the
+  change; the text had said no accepted schema changes meaning. Stage D
+  ships with stage L's zero-edit paths, since D alone makes every full-text
+  read a whole-field scan. Corrected against Lance 13's source: an IVF_FLAT
+  cosine index scores under cosine, not L2, so the re-score is for
+  bit-equality with the flat path; the limited full-text path is bulk
+  MAXSCORE by default, switched by three environment variables the engine
+  pins or the plan records. Compatibility gains the scan's cost. Gates
+  added: a checked-in cost instrument, and the token column's design before
+  stage L. Unresolved questions 6 and 7 are new.
